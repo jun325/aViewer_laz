@@ -1,0 +1,33 @@
+object WndFocusRect: TWndFocusRect
+  Left = 1788
+  Height = 48
+  Top = 662
+  Width = 221
+  BorderIcons = []
+  BorderStyle = bsNone
+  ClientHeight = 48
+  ClientWidth = 221
+  Color = clWindow
+  Font.Color = clWindowText
+  Font.Height = -11
+  Font.Name = 'Tahoma'
+  FormStyle = fsStayOnTop
+  OnClose = FormClose
+  OnDeactivate = FormDeactivate
+  LCLVersion = '2.0.10.0'
+  object Shape1: TShape
+    Left = 0
+    Height = 48
+    Top = 0
+    Width = 221
+    Align = alClient
+    Brush.Color = clRed
+  end
+  object Shape2: TShape
+    Left = 5
+    Height = 38
+    Top = 5
+    Width = 211
+    Anchors = [akTop, akLeft, akRight, akBottom]
+  end
+end
