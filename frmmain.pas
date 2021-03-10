@@ -19,29 +19,36 @@ You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 *)
-{$mode objfpc}{$H+}
+{$mode delphi}{$H+}
 
 interface
 
 uses
   Windows, Classes, SysUtils, FileUtil, activexcontainer, Forms, Controls, strUtils,
-  Graphics, Dialogs, StdCtrls, ComCtrls, ExtCtrls, ActnList, Menus, Math,
+  Graphics, Dialogs, StdCtrls, ComCtrls, CommCtrl, ExtCtrls, ActnList, Menus, Math,
   SHDocVw_1_1_TLB, MSHTML_TLB, iAccessible2Lib_tlb, UIAutomationClient_TLB,
   ISimpleDOM, UIA_TLB, IntList, IniFiles, oleacc, Variants, regexpr,
-  ActiveX, FocusRectWnd;
+  ActiveX, FocusRectWnd, TipWnd, multimon, LazUTF8, LConvEncoding;
 
 {$EXTERNALSYM VariantInit}
 procedure VariantInit(var varg: olevariant); stdcall;
   external 'oleaut32.dll' Name 'VariantInit';
+procedure NotifyWinEvent(event: DWORD; hwnd: HWND; idObject, idChild: LONG); stdcall;
+{$EXTERNALSYM NotifyWinEvent}
 
-
+const
+  EVENT_OBJECT_DESTROY = $8001; // hwnd + ID + idChild is destroyed item
+  {$EXTERNALSYM EVENT_OBJECT_DESTROY}
+OBJID_CLIENT   = DWORD($FFFFFFFC);
+    {$EXTERNALSYM OBJID_CLIENT}
 
 
 type
   HWINEVENTHOOK = HANDLE;
    {$EXTERNALSYM TFNWinEventProc}
   TFNWinEventProc = procedure(hWinEventHook: THandle; event: DWORD;
-    hwnd: HWND; idObject, idChild: longint; idEventThread, dwmsEventTime: DWORD); stdcall;
+    hwnd: HWND; idObject, idChild: longint; idEventThread, dwmsEventTime: DWORD);
+    stdcall;
 
   IStylesProvider = interface;
 
@@ -97,6 +104,23 @@ type
     ID: integer;
     PName: string;
     Value: olevariant;
+  end;
+
+  TObjectProcedure = procedure of object;
+
+  TWBEvent = class(TInterfacedObject, IDispatch)
+  private
+    FOnEvent: TObjectProcedure;
+  protected
+    function GetTypeInfoCount(out Count: integer): HResult; stdcall;
+    function GetTypeInfo(Index, LocaleID: integer; out TypeInfo): HResult; stdcall;
+    function GetIDsOfNames(const IID: TGUID; Names: Pointer;
+      NameCount, LocaleID: integer; DispIDs: Pointer): HResult; stdcall;
+    function Invoke(DispID: integer; const IID: TGUID; LocaleID: integer;
+      Flags: word; var Params; VarResult, ExcepInfo, ArgErr: Pointer): HResult; stdcall;
+  public
+    constructor Create(const OnEvent: TObjectProcedure);
+    property OnEvent: TObjectProcedure read FOnEvent write FOnEvent;
   end;
 
   { TwndMain }
@@ -177,16 +201,21 @@ type
     tvUIA: TTreeView;
     procedure acCursorExecute(Sender: TObject);
     procedure acFocusExecute(Sender: TObject);
+    procedure acRectExecute(Sender: TObject);
+    procedure acShowTipExecute(Sender: TObject);
+    procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
+    procedure mnuSelModeClick(Sender: TObject);
     procedure Timer1Timer(Sender: TObject);
     procedure tvMSAAAddition(Sender: TObject; Node: TTreeNode);
+    procedure tvMSAAChange(Sender: TObject; Node: TTreeNode);
     procedure tvMSAADeletion(Sender: TObject; Node: TTreeNode);
     procedure tvMSAAExpanding(Sender: TObject; Node: TTreeNode;
       var AllowExpansion: boolean);
   private
     WB1: TEvsWebBrowser;
-    bTer: boolean;
+    bTer, bTVChanging, bDeletion: boolean;
     HTMLsFF: array [0..2, 0..1] of string;
     ARIAs: array [0..1, 0..1] of string;
     IA2Sts: array [0..17] of string;
@@ -203,7 +232,7 @@ type
     StyleID: array [0..16] of string;
     oldPT: TPoint;
     WndFocus, WndLabel, WndDesc, WndTarg: TwndFocusRect;
-    //WndTip: TfrmTipWnd;
+    WndTip: TfrmTipWnd;
     hRgn1, hRgn2, hRgn3: hRgn;
 
     Created: boolean;
@@ -254,11 +283,17 @@ type
     procedure GetNaviState(AllFalse: boolean = False);
     procedure ShowRectWnd(bkClr: TColor);
     procedure ShowRectWnd2(bkClr: TColor; RC: TRect);
+    function GetTreeStructure: boolean;
     procedure CreateMSAATree;
-    procedure GetTreeStructure;
     function Get_RoleText(Acc: IAccessible; Child: integer): string;
     function ARIAText: string;
     procedure WriteHTML;
+    procedure SetTreeMode(selNode: TTreeNode);
+    procedure ShowTipWnd;
+    procedure SetBalloonPos(X, Y: integer);
+    procedure ShowBalloonTip(Control: TWinControl; wIcon: integer;
+      dTitle: PChar; dText: string; RC: TRect; X, Y: integer; Track: boolean = False);
+    procedure WBOnClick;
   public
 
   end;
@@ -285,6 +320,7 @@ var
 
 implementation
 
+procedure NotifyWinEvent; external user32 name 'NotifyWinEvent';
 //function SetWinEventHook(EventMin, EventMax: UINT; HMod: HMODULE;
 //  EventProc: WINEVENTPROC; IDProcess, IDThread: DWORD; Flags: UINT): HWINEVENTHOOK;
 //  external 'User32.dll';
@@ -1466,7 +1502,7 @@ begin
           mItem.RadioItem := True;
           mItem.GroupIndex := 1;
           //mItem.AutoCheck := True;
-          mItem.OnClick := @mnuLangChildClick;
+          mItem.OnClick := mnuLangChildClick;
           if LowerCase(TransPath) = LowerCase(TransDir + LangList[i]) then
             mItem.Checked := True
           else
@@ -1520,10 +1556,12 @@ begin
   WB1 := TEvsWebBrowser.Create(Self);
   AXC1.ComServer := WB1.ComServer;
   AXC1.Active := True;
-  WB1.OnStatusTextChange := @OnStatusTextChange;
+  WB1.OnStatusTextChange := OnStatusTextChange;
   WB1.ComServer.Set_Silent(True);
   onull := NULL;
   url := 'about:blank';
+  bTVChanging := False;
+  bDeletion := false;
   WB1.ComServer.Navigate2(url, onull, onull, onull, onull);
   APPDir := IncludeTrailingPathDelimiter(ExtractFileDir(Application.ExeName));
   TransDir := IncludeTrailingPathDelimiter(AppDir + 'Languages');
@@ -1547,6 +1585,7 @@ begin
   LangList := TStringList.Create;
   Created := True;
   SPath := IncludeTrailingPathDelimiter(GetMyDocPath) + 'MSAAV.ini';
+  caption := spath;
   acParent.Enabled := False;
   acChild.Enabled := False;
   acPrevS.Enabled := False;
@@ -1572,9 +1611,127 @@ begin
   ExecCmdLine;
 end;
 
+procedure TwndMain.FormClose(Sender: TObject; var CloseAction: TCloseAction);
+var
+    ini: TMemINiFile;
+begin
+	// UIAuto.Free;
+
+	UIAuto := nil;
+
+	NotifyWinEvent(EVENT_OBJECT_DESTROY, Handle, OBJID_CLIENT, 0);
+
+	if hHook <> 0 then
+	begin
+		if UnhookWinEvent(hHook) then
+		begin
+			// FreeHookInstance(HookProc);
+			hHook := 0;
+		end;
+	end;
+
+	try
+		if FileExists(SPath) then
+		begin
+			ini := TMemInifile.Create(SPath, TEncoding.Unicode);
+			try
+				ini.WriteInteger('Settings', 'Width', Width);
+				ini.WriteInteger('Settings', 'Height', Height);
+				ini.WriteInteger('Settings', 'Top', top);
+				ini.WriteInteger('Settings', 'Left', left);
+				// P2W, P4H: integer;
+				ini.WriteInteger('Settings', 'P2W', PageControl1.Width);
+				ini.WriteBool('Settings', 'vMSAA', mnuMSAA.Checked);
+				ini.WriteBool('Settings', 'vARIA', mnuARIA.Checked);
+				ini.WriteBool('Settings', 'vHTML', mnuHTML.Checked);
+				ini.WriteBool('Settings', 'vIA2', mnuIA2.Checked);
+				ini.WriteBool('Settings', 'vUIA', mnuUIA.Checked);
+				ini.WriteBool('Settings', 'TVAll', mnuAll.Checked);
+
+				ini.WriteBool('Settings', 'bMSAA', mnublnMSAA.Checked);
+				ini.WriteBool('Settings', 'bIA2', mnublnIA2.Checked);
+				ini.WriteBool('Settings', 'bCode', mnublnCode.Checked);
+				ini.UpdateFile;
+			finally
+				ini.Free;
+			end;
+		end;
+    bTer := True;
+
+
+		ClsNames.Free;
+		TBList.Free;
+    uTBList.Free;
+    DList.Free;
+    uDList.Free;
+		LangList.Free;
+		CoUnInitialize;
+		if hWndTip <> 0 then
+			DestroyWindow(hWndTip);
+	except
+
+	end;
+
+end;
+
 procedure TwndMain.acFocusExecute(Sender: TObject);
 begin
   acFocus.Checked := not acFocus.Checked;
+end;
+
+procedure TwndMain.acRectExecute(Sender: TObject);
+var
+  RC: UIAutomationClient_TLB.TagRect;
+begin
+  acRect.Checked := not acRect.Checked;
+  if acRect.Checked then
+  begin
+    if not Assigned(WndFocus) then
+      WndFocus := TWndFocusRect.Create(self);
+    if PageControl1.ActivePageIndex = 0 then
+      ShowRectWnd(clRed)
+    else
+    begin
+      if Assigned(UIEle) then
+      begin
+        UIEle.Get_CurrentBoundingRectangle(RC);
+        ShowRectWnd2(clBlue, Rect(rc.left, rc.top, rc.right -
+          rc.left, rc.bottom - rc.top));
+      end;
+    end;
+  end
+  else
+  begin
+    FreeAndNil(WndFocus);
+    FreeAndNil(WndLabel);
+    FreeAndNil(WndDesc);
+    FreeAndNil(WndTarg);
+    WndFocus := nil;
+    WndLabel := nil;
+    WndDesc := nil;
+    WndTarg := nil;
+  end;
+end;
+
+procedure TwndMain.acShowTipExecute(Sender: TObject);
+begin
+  acShowTip.Checked := not acShowTip.Checked;
+  if acShowTip.Checked then
+  begin
+    ShowTipWnd;
+  end
+  else
+  begin
+    if WndTip <> nil then
+    begin
+      SendMessage(WndTip.TipInfo.Handle, EM_HIDEBALLOONTIP, 0, 0);
+      FreeAndNil(WndTip);
+      WndTip := nil;
+    end;
+    if hWndTip <> 0 then
+      DestroyWindow(hWndTip);
+
+  end;
 end;
 
 procedure TwndMain.acCursorExecute(Sender: TObject);
@@ -1585,6 +1742,12 @@ end;
 procedure TwndMain.FormDestroy(Sender: TObject);
 begin
   WB1.Free;
+end;
+
+procedure TwndMain.mnuSelModeClick(Sender: TObject);
+begin
+  bSelMode := not bSelMode;
+  mnuSelmode.Checked := bSelMode;
 end;
 
 procedure TwndMain.Timer1Timer(Sender: TObject);
@@ -1738,10 +1901,80 @@ begin
 
 end;
 
+procedure TwndMain.SetTreeMode(selNode: TTreeNode);
+var
+  b: boolean;
+  RC: Tagrect;
+begin
+
+  if (Assigned(TTreeData(selNode.Data^).Acc)) and (PageControl1.ActivePageIndex = 0) then
+  begin
+    Treemode := True;
+    VarParent := TTreeData(selNode.Data^).iID;
+    iAcc := TTreeData(selNode.Data^).Acc;
+
+    b := GetTreeStructure;
+    GetNaviState;
+    if (acRect.Checked) then
+    begin
+      ShowRectWnd(clRed);
+    end;
+    if b then
+    begin
+      if (acShowTip.Checked) then
+      begin
+        ShowTipWnd;
+      end;
+    end;
+  end;
+  {if (Assigned(TTreeData(pNode.Data^).uiEle)) and
+    (PageControl1.ActivePageIndex = 1) then
+  begin
+    Treemode := True;
+    uiEle := TTreeData(pNode.Data^).uiEle;
+
+    ShowText4UIA;
+    GetNaviState;
+    if (acRect.Checked) then
+    begin
+      uiEle.Get_CurrentBoundingRectangle(RC);
+      ShowRectWnd2(clBlue, Rect(RC.Left, RC.Top, RC.Right - RC.Left,
+        RC.Bottom - RC.Top));
+    end;
+    if (acShowTip.Checked) then
+    begin
+      ShowTipWnd;
+    end;
+  end; }
+
+end;
+
+procedure TwndMain.tvMSAAChange(Sender: TObject; Node: TTreeNode);
+begin
+  if bSelMode then
+    Exit;
+  if tvMSAA.SelectionCount = 0 then
+  begin
+    mnuTVSSel.Enabled := False;
+    mnuTVOSel.Enabled := False;
+  end
+  else
+  begin
+    mnuTVSSel.Enabled := True;
+    mnuTVOSel.Enabled := True;
+    if tvMSAA.SelectionCount > 1 then
+      Exit;
+  end;
+  if (not bTVChanging) and (not bDeletion) then
+    SetTreeMode(Node);
+end;
+
 procedure TwndMain.tvMSAADeletion(Sender: TObject; Node: TTreeNode);
 begin
+  bDeletion := True;
   if Assigned(Node.Data) then
     Dispose(PTreeData(Node.Data));
+  bDeletion := False;
 end;
 
 procedure TwndMain.tvMSAAExpanding(Sender: TObject; Node: TTreeNode;
@@ -2820,7 +3053,7 @@ begin
                     begin
                       if Assigned(ResEle) then
                       begin
-                        ws := None;
+                        ws := WideString(None);
                         if (Pagecontrol1.ActivePageIndex = 0) and (not HTMLOut) then
                         begin
                           iaTarg := GetMSAA;
@@ -2834,7 +3067,7 @@ begin
                         begin
                           // UIA_LegacyIAccessibleNamePropertyId = 30092
                           ResEle.GetCurrentPropertyValue(30092, oVal);
-                          ws := string(oVal);
+                          ws := WideString(oVal);
                         end;
                         if not HTMLout then
                         begin
@@ -3674,6 +3907,219 @@ begin
   end;
 end;
 
+procedure TwndMain.ShowBalloonTip(Control: TWinControl; wIcon: integer;
+  dTitle: PChar; dText: string; RC: TRect; X, Y: integer; Track: boolean = False);
+var
+
+  hhWnd: THandle;
+  TP1: TPoint;
+  Wnd: hwnd;
+begin
+  WindowFromAccessibleObject(iAcc, Wnd);
+  hhWnd := Control.Handle;
+  hWndTip := CreateWindow(TOOLTIPS_CLASS, nil, WS_POPUP or
+    TTS_NOPREFIX {or TTS_BALLOON} or TTS_ALWAYSTIP,//or TTS_CLOSE ,
+    RC.Left, RC.Top, 0, 0, hhWnd, 0, HInstance, nil);
+  if hWndTip <> 0 then
+  begin
+
+    //ti.cbSize := SizeOf(ti);
+    if not Track then
+      ti.uFlags := {TTF_CENTERTIP or }{TTF_IDISHWND  or }TTF_TRANSPARENT or
+        TTF_SUBCLASS {or TTF_TRACK or TTF_ABSOLUTE}
+    else
+      ti.uFlags := {TTF_CENTERTIP or }{TTF_IDISHWND  or }TTF_TRANSPARENT or
+        TTF_SUBCLASS or TTF_TRACK or TTF_ABSOLUTE;
+    ti.hwnd := wnd{hhWnd};
+    ti.uId := 1;
+
+    ti.lpszText := PChar(CP932ToUTF8(dText));
+    ti.Rect := RC;
+
+    SendMessageW(hWndTip, TTM_SETMAXTIPWIDTH, 0, 640);
+    SendMessage(hWndTip, TTM_ADDTOOL, 1, integer(@ti));
+    //SendMessage(hWndTip, TTM_SETTITLE, wIcon,  Integer(dtitle));
+
+    TP1.X := Control.Left;
+    TP1.Y := Control.Top;
+    TP1 := Control.ClientToScreen(TP1);
+    if not Track then
+    begin
+      SendMessage(hWndTip, TTM_TRACKPOSITION, 0, MAKELONG(X, Y));
+      sendMessage(hWndTip, TTM_TRACKACTIVATE, 1, integer(@ti));
+    end;
+  end;
+end;
+
+procedure TwndMain.SetBalloonPos(X, Y: integer);
+begin
+  SendMessage(hWndTip, TTM_TRACKPOSITION, 0, MAKELONG(X, Y));
+  sendMessage(hWndTip, TTM_TRACKACTIVATE, 1, integer(@ti));
+end;
+
+procedure TwndMain.ShowTipWnd;
+var
+  tRC: TagRect;
+  RC: TRect;
+  vChild: variant;
+  Mon: TMonitor;
+  s, dsrc, c, inner, outer: string;
+  sLeft, sTop, i, iRes, iCnt: integer;
+  iSP: IServiceProvider;
+  iEle: IHTMLElement;
+  isd: ISimpleDOMNode;
+  PC: pwidechar;
+  PC2: PwideChar;
+  SI: smallint;
+  PU, PU2: PUINT;
+  WD: word;
+  iText: ISimpleDOMText;
+  tinfo: TToolInfo;
+  wnd: HWND;
+  monEx: TMonitorInfoEx;
+  hm: HMonitor;
+  hr: HResult;
+begin
+
+  try
+    if (PageControl1.ActivePageIndex = 0) and (Assigned(iAcc)) then
+    begin
+      if mnublnMSAA.Checked then
+        s := s + MSAAText(iAcc, True);
+      if mnublnIA2.Checked then
+        s := s + SetIA2Text(iAcc, False);
+
+      if mnublnCode.Checked then
+      begin
+        c := sHTML;
+        inner := sTypeFF;
+        outer := sTypeIE;
+        hr := iAcc.QueryInterface(IID_IServiceProvider, iSP);
+        if (hr = 0) and (Assigned(iSP)) then
+        begin
+          hr := iSP.QueryService(IID_IHTMLElement, IID_IHTMLElement, iEle);
+          if (hr = 0) and (Assigned(iEle)) then
+          begin
+
+            if (SUCCEEDED(iSP.QueryService(IID_IHTMLElement, IID_IHTMLElement,
+              iEle))) then
+            begin
+              dsrc := iEle.outerHTML;
+              dsrc := copy(dsRC, 0, ShowSrcLen);
+              s := s + c + outer + ':' + #13#10 + dsrc;
+            end;
+          end
+          else
+          begin
+            hr := iSP.QueryService(IID_ISIMPLEDOMNODE, IID_ISIMPLEDOMNODE, isd);
+            if (hr = 0) and (Assigned(isd)) then
+            begin
+              isd.get_nodeInfo(PC, SI, PC2, PU, PU2, WD);
+
+              if WD <> 3 then
+              begin
+                PC := '';
+                isd.get_innerHTML(PC);
+                dsrc := copy(PC, 0, ShowSrcLen);
+                s := s + c + inner + #13#10 + dsrc;
+              end
+              else
+              begin
+                iSP := isd as IServiceProvider;
+                if SUCCEEDED(iSP.QueryInterface(IID_ISIMPLEDOMTEXT, iText)) then
+                begin
+                  iText.get_domText(PC);
+                  dsrc := copy(PC, 0, ShowSrcLen);
+                  s := s + c + '(' + sTxt + ')' + #13#10 + dsrc;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      vChild := VarParent; // CHILDID_SELF;
+      iAcc.accLocation(RC.Left, RC.Top, RC.Right, RC.Bottom, vChild);
+      sLeft := RC.Left;
+      sTop := RC.Bottom;
+      WindowFromAccessibleObject(iAcc, Wnd);
+    end//if MSAA
+    else
+    begin
+      {s := sUIATxt;
+      if SUCCEEDED(UIEle.Get_CurrentBoundingRectangle(tRC)) then
+      begin
+
+        RC := Rect(tRc.left, tRC.top, tRC.right, tRC.bottom);
+      end;
+      sLeft := RC.Left;
+      sTop := RC.Bottom; }
+    end;
+
+    if hWndTip <> 0 then
+    begin
+      DestroyWindow(hWndTip);
+    end;
+
+
+    tinfo.cbSize := SizeOf(tinfo);
+    tinfo.HWND := Wnd;
+    tinfo.uId := 1;
+    ShowBalloonTip(self, 1, 'Aviewer', s, RC, sLeft, sTop, True);
+    //SetBalloonPos(sLeft, sTop);
+    iRes := SendMessage(hWndTip, TTM_GETBUBBLESIZE, 0, integer(@tinfo));
+
+    if iRes > 0 then
+    begin
+      i := HIWORD(iRes);
+
+      FillChar(monEx, SizeOf(TMonitorInfoEx), #0);
+      monEx.cbSize := SizeOf(monEx);
+      for iCnt := 0 to Screen.MonitorCount - 1 do
+      begin
+
+        GetMonitorInfo(Screen.Monitors[iCnt].Handle, @monEx);
+        hm := MonitorFromWindow(hWndTip, MONITOR_DEFAULTTONEAREST);
+        // if PtInRect(monEx.rcMonitor , TP) then
+        if hm = Screen.Monitors[iCnt].Handle then
+        begin
+          Mon := Screen.Monitors[iCnt]; // Screen.MonitorFromRect(rc);
+
+          if ((RC.Top + i + 20) > Mon.WorkareaRect.Bottom) then
+            sTop := RC.Top - i - 20 // - RC2.top)
+          else if (RC.Top + RC.Bottom) > Mon.WorkareaRect.Bottom then
+            sTop := RC.Top - i - 20
+          else
+            sTop := RC.Top + RC.Bottom;
+          if sTop < 0 then
+            sTop := 0;
+
+          if (RC.Left + LOWORD(iRes)) > (Mon.WorkareaRect.Left +
+            Mon.WorkareaRect.Right) then
+            sLeft := Mon.WorkareaRect.Right - LOWORD(iRes)
+          else if RC.Left < Mon.WorkareaRect.Left then
+            sLeft := Mon.WorkareaRect.Left
+          else
+            sLeft := RC.Left;
+
+          SetBalloonPos(sLeft, sTop);
+          break;
+        end;
+      end;
+    end
+    else
+    begin
+      SetBalloonPos(sLeft, sTop);
+    end;
+
+  except
+    on E: Exception do
+    begin
+      ShowErr(E.Message);
+    end;
+  end;
+
+end;
+
 procedure TwndMain.ShowRectWnd(bkClr: TColor);
 var
   RC: TRect;
@@ -4026,7 +4472,7 @@ begin
   Result := sARIA + #13#10 + ARIAs[1, 1] + #13#10#13#10;
 end;
 
-procedure TwndMain.GetTreeStructure;
+function TwndMain.GetTreeStructure: boolean;
 var
   iSP: IServiceProvider;
   iEle, paEle: IHTMLElement;
@@ -4036,7 +4482,7 @@ var
   SI: smallint;
   PU, PU2: PUINT;
   WD: word;
-  PC, PC2: PChar;
+  PC, PC2: PWideChar;
   pAcc: IAccessible;
   iRes: integer;
   iDoc: IHTMLDocument2;
@@ -4064,6 +4510,8 @@ const
 begin
   if not Assigned(iAcc) then
     Exit;
+  Result := False;
+  bTVChanging := True;
   sMSAAtxt := '';
   sHTMLtxt := '';
   sUIATxt := '';
@@ -4074,6 +4522,8 @@ begin
   sCodeTxt := '';
 
   GetNaviState(True);
+
+
   CEle := nil;
   SDom := nil;
   Path := IncludeTrailingPathDelimiter(ExtractFileDir(Application.ExeName));
@@ -4081,7 +4531,7 @@ begin
     ShowRectWnd(clYellow)
   else if (acRect.Checked) then
   begin
-    ShowRectWnd(clRed);
+    //ShowRectWnd(clRed);
   end;
 
   try
@@ -4102,7 +4552,7 @@ begin
           end;
           if mnuHTML.Checked then
           begin
-            HTMLText;
+            sHTMLtxt := HTMLText;
           end;
         end;
 
@@ -4123,26 +4573,101 @@ begin
               iRes := iSP.QueryService(IID_IACCESSIBLE, IID_IACCESSIBLE, pAcc);
               if SUCCEEDED(iRes) and Assigned(pAcc) then
               begin
+                tvMSAA.Items.Clear;
                 CreateMSAATree;
-                WriteHTML;
+
               end;
             end;
           end;
         end;
+
       end
       else  //IHTMLElement is not support
       begin
         iRes := iSP.QueryService(IID_ISIMPLEDOMNODE, IID_ISIMPLEDOMNODE, isEle);
         if SUCCEEDED(iRes) and Assigned(isEle) then
         begin
-
+          SDom := isEle;
+          if (PageControl1.ActivePageIndex = 0) or (TreeMode) then
+          begin
+            if mnuARIA.Checked then
+            begin
+              sARIATxt := ARIAText;
+            end;
+            if mnuHTML.Checked then
+            begin
+              sHTMLtxt := HTMLText4FF;
+            end;
+          end;
+          if (not Treemode) then
+          begin
+            iRes := iSP.QueryService(IID_ISIMPLEDOMNODE, IID_ISIMPLEDOMNODE, isEle);
+            if SUCCEEDED(iRes) and Assigned(isEle) then
+            begin
+              isEle.get_nodeInfo(PC, SI, PC2, PU, PU2, WD);
+              TempEle := isEle;
+              i := 0;
+              if mnuAll.Checked then
+              begin
+                // while (WD <> NODETYPE_DOCUMENT) do
+                while (LowerCase(string(PC)) <> '#document') do
+                begin
+                  Application.ProcessMessages;
+                  TempEle.get_parentNode(pEle);
+                  pEle.get_nodeInfo(PC, SI, PC2, PU, PU2, WD);
+                  TempEle := pEle;
+                  if string(PC) = '#document' then
+                  begin
+                    isEle := pEle;
+                  end;
+                  Inc(i);
+                  if i > 500 then
+                  begin
+                    isEle := nil;
+                    break;
+                  end;
+                  // ROLE_SYSTEM_DOCUMENT
+                end; // end while
+              end;
+              if Assigned(isEle) then
+              begin
+                iRes := isEle.QueryInterface(IID_IServiceProvider, iSP);
+                if SUCCEEDED(iRes) and Assigned(iSP) then
+                begin
+                  iRes := iSP.QueryService(IID_IACCESSIBLE,
+                    IID_IACCESSIBLE, pAcc);
+                  if SUCCEEDED(iRes) and Assigned(pAcc) then
+                  begin
+                    tvMSAA.Items.Clear;
+                    CreateMSAATree;
+                  end;
+                end;
+              end;
+            end;
+          end;
         end
         else
         begin
+          tvMSAA.Items.Clear;
+          CreateMSAATree;
 
         end;
       end;
     end;
+    if (PageControl1.ActivePageIndex = 0) or (TreeMode) then
+    begin
+      if mnuIA2.Checked then
+        sIA2Txt := SetIA2Text;
+      if mnuUIA.Checked then
+        sUIATxt := UIAText;
+      if Treemode then
+        GetNaviState;
+      WriteHTML;
+
+    end;
+    bTVChanging := False;
+    Result := True;
+
   finally
   end;
 end;
@@ -4160,60 +4685,112 @@ begin
   if sBodyTxt = '' then
     exit;
 
-  if GetTemp(sTemp) then
-  begin
-    sTemp := sTemp + 'avwr_temp.html';
-    url := sTemp;
 
-    List := TStringList.Create;
-    RS := TResourceStream.Create(hInstance, 'VLIST', PChar('TEXT'));
+  List := TStringList.Create;
+  RS := TResourceStream.Create(hInstance, 'VLIST', PChar('TEXT'));
+  try
     try
-      try
 
-        List.LoadFromStream(RS);
-        List.Text := StringReplace(List.Text, '%body%', sBodyTxt,
-          [rfReplaceAll, rfIgnoreCase]);
-        List.Text := StringReplace(List.Text, '%code%', sCodeTxt,
-          [rfReplaceAll, rfIgnoreCase]);
-        List.Text := StringReplace(List.Text, '%fs%', IntToStr(Font.Size) +
-          'pt', [rfReplaceAll, rfIgnoreCase]);
-        List.Text := StringReplace(List.Text, '%ff%', Font.Name,
-          [rfReplaceAll, rfIgnoreCase]);
-        List.SaveToFile(sTemp);
-        WB1.ComServer.Navigate2(url, onull, onull, onull, onull);
-        {hr := wb1.ComServer.Document.QueryInterface(IID_IHTMLDOCUMENT2, WBDoc);
-        if (SUCCEEDED(hr)) and (Assigned(WBDoc)) then
-        begin
-          arOle := VarArrayCreate([0, 0], VarVariant);
-          try
-            VarArrayLock(arOle);
-            arOle[0] := List.Text;
-            WBDoc.Writeln(PSafeArray(System.TVarData(arOle).VArray));
-            WBDoc.Close;
-            //WBDoc.onclick := (TWBEvent.Create(WBOnClick) as IDispatch);
-          finally
-            VarArrayUnLock(arOle);
-            VarClear(arOle);
-          end;
-        end;}
-      except
-        on E: Exception do
-        begin
-          ShowMessage(E.Message);
-          Exit;
+      List.LoadFromStream(RS);
+      List.Text := StringReplace(List.Text, '%body%', sBodyTxt,
+        [rfReplaceAll, rfIgnoreCase]);
+      List.Text := StringReplace(List.Text, '%code%', sCodeTxt,
+        [rfReplaceAll, rfIgnoreCase]);
+      List.Text := StringReplace(List.Text, '%fs%', IntToStr(Font.Size) +
+        'pt', [rfReplaceAll, rfIgnoreCase]);
+      List.Text := StringReplace(List.Text, '%ff%', Font.Name,
+        [rfReplaceAll, rfIgnoreCase]);
+
+      hr := wb1.ComServer.Document.QueryInterface(IID_IHTMLDOCUMENT2, WBDoc);
+      if (SUCCEEDED(hr)) and (Assigned(WBDoc)) then
+      begin
+
+        arOle := VarArrayCreate([0, 0], VarVariant);
+        try
+          VarArrayLock(arOle);
+          arOle[0] := List.Text;
+          WBDoc.Writeln(PSafeArray(System.TVarData(arOle).VArray));
+          WBDoc.Close;
+          WBDoc.onclick := (TWBEvent.Create(WBOnClick) as IDispatch);
+        finally
+          VarArrayUnLock(arOle);
+          VarClear(arOle);
         end;
       end;
-    finally
-      RS.Free;
-      List.Free;
+    except
+      on E: Exception do
+      begin
+        ShowMessage(E.Message);
+        Exit;
+      end;
     end;
-
+  finally
+    RS.Free;
+    List.Free;
   end;
+end;
+
+procedure TwndMain.WBOnClick;
+var
+  iEle: IHTMLElement;
+  WBDoc: IHTMLDocument2;
+  hr: hresult;
+  sName, sid: string;
+begin
+
+  hr := wb1.ComServer.Document.QueryInterface(IID_IHTMLDOCUMENT2, WBDoc);
+  if (SUCCEEDED(hr)) and (Assigned(WBDoc)) then
+  begin
+    iEle := WBDoc.parentWindow.event.srcElement;
+    sName := LowerCase(iEle.tagName);
+    sID := iEle.id;
+    if (sName = 'button') and (sID = 'exe_da') then
+    begin
+      iAcc.accDoDefaultAction(VarParent);
+
+    end;
+  end;
+
 end;
 
 procedure TwndMain.OnStatusTextChange(Sender: TObject; Text_: WideString);
 begin
   //Label1.Caption:='Browser: '+UTF8Encode(Text_);
+end;
+
+constructor TWBEvent.Create(const OnEvent: TObjectProcedure);
+begin
+  inherited Create;
+  FOnEvent := OnEvent;
+end;
+
+function TWBEvent.GetIDsOfNames(const IID: TGUID; Names: Pointer;
+  NameCount, LocaleID: integer; DispIDs: Pointer): HResult;
+begin
+  Result := E_NOTIMPL;
+end;
+
+function TWBEvent.GetTypeInfo(Index, LocaleID: integer; out TypeInfo): HResult;
+begin
+  Result := E_NOTIMPL;
+end;
+
+function TWBEvent.GetTypeInfoCount(out Count: integer): HResult;
+begin
+  Result := E_NOTIMPL;
+end;
+
+function TWBEvent.Invoke(DispID: integer; const IID: TGUID; LocaleID: integer;
+  Flags: word; var Params; VarResult, ExcepInfo, ArgErr: Pointer): HResult;
+begin
+  if (DispID = DISPID_VALUE) then
+  begin
+    if Assigned(FOnEvent) then
+      FOnEvent;
+    Result := S_OK;
+  end
+  else
+    Result := E_NOTIMPL;
 end;
 
 end.

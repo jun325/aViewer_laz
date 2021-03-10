@@ -4141,6 +4141,7 @@ object wndMain: TwndMain
     000CEAFF00D94D4C7AA44BE9550000000049454E44AE426082
   }
   Menu = MainMenu1
+  OnClose = FormClose
   OnCreate = FormCreate
   OnDestroy = FormDestroy
   LCLVersion = '2.0.10.0'
@@ -4280,6 +4281,7 @@ object wndMain: TwndMain
         MultiSelect = True
         TabOrder = 0
         OnAddition = tvMSAAAddition
+        OnChange = tvMSAAChange
         OnDeletion = tvMSAADeletion
         OnExpanding = tvMSAAExpanding
         Options = [tvoAllowMultiselect, tvoAutoItemHeight, tvoHideSelection, tvoKeepCollapsedNodes, tvoShowButtons, tvoShowLines, tvoShowRoot, tvoToolTips, tvoThemedDraw]
@@ -4714,6 +4716,7 @@ object wndMain: TwndMain
     object acRect: TAction
       Caption = 'acRect'
       ImageIndex = 2
+      OnExecute = acRectExecute
     end
     object acCopy: TAction
       Caption = 'acCopy'
@@ -4746,6 +4749,7 @@ object wndMain: TwndMain
     object acShowTip: TAction
       Caption = 'acShowTip'
       ImageIndex = 3
+      OnExecute = acShowTipExecute
     end
     object acSetting: TAction
       Caption = 'acSetting'
@@ -4878,6 +4882,7 @@ object wndMain: TwndMain
     end
     object mnuSelMode: TMenuItem
       Caption = 'S&elect Mode'
+      OnClick = mnuSelModeClick
     end
   end
   object Timer2: TTimer
